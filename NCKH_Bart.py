@@ -1,180 +1,205 @@
-import json
+import os
 import numpy as np
 import torch
 import torch.nn as nn
-from datasets import Dataset
-from transformers import BartForConditionalGeneration, TrainingArguments, Trainer
-from torch.utils.data import DataLoader
 
-# ============================
-# 1. Tải dữ liệu (T, 151)
-# ============================
+from datasets import Dataset
+from huggingface_hub import snapshot_download
+from transformers import (
+    BartModel,
+    BartForConditionalGeneration,
+    BartTokenizer,
+    BartConfig,
+    TrainingArguments,
+    Trainer,
+    GenerationConfig
+)
+
+from transformers.models.bart.modeling_bart import BartEncoder
+# Load data from pose and text files
+
+print("\n--- Loading Data From Files---")
+
 def load_data_from_files(pose_path, text_path, num_samples=1000):
     data = []
     with open(pose_path, "r") as pose_file, open(text_path, "r") as text_file:
         pose_lines = pose_file.readlines()
         text_lines = text_file.readlines()
-        
-        num_samples = min(num_samples, len(pose_lines), len(text_lines))
+
+        assert len(pose_lines) == len(text_lines), "Mismatch in pose and text lines!"
+
+        num_samples = min(num_samples, len(pose_lines))
         for i in range(num_samples):
             pose_array = np.array([float(x) for x in pose_lines[i].strip().split()])
-            pose_array = pose_array.reshape(-1, 151)  # Chuyển thành (T, 151)
+            pose_array = pose_array.reshape(-1, 151)[:, :150]  # Only use 150 features
             text = text_lines[i].strip()
             data.append({"pose": pose_array, "text": text})
-    return data
 
-mode_file = "dev"
-pose_path = "./DATASET/" + mode_file + ".skels"
-text_path = "./DATASET/" + mode_file + ".text"
-data = load_data_from_files(pose_path, text_path, num_samples=10)
+    return Dataset.from_list(data)
 
-dataset = Dataset.from_list(data)
-split_dataset = dataset.train_test_split(test_size=0.2)
+# Download dataset from Huggingface
+data_folder = snapshot_download("ura-hcmut/how2sign", repo_type="dataset")
 
-# ============================
-# 2. Định nghĩa mô hình BART với Embedding mới
-# ============================
-class CustomBART(nn.Module):
-    def __init__(self, bart_model_name="facebook/bart-base"):
-        super().__init__()
-        self.bart = BartForConditionalGeneration.from_pretrained(bart_model_name)
+TRAIN_POSE = os.path.join(data_folder, "train.skels")
+TRAIN_TEXT = os.path.join(data_folder, "train.text")
+TEST_POSE = os.path.join(data_folder, "test.skels")
+TEST_TEXT = os.path.join(data_folder, "test.text")
+
+train_data = load_data_from_files(TRAIN_POSE, TRAIN_TEXT, num_samples=80)
+test_data = load_data_from_files(TEST_POSE, TEST_TEXT, num_samples=20)
+
+print("Sample input pose shape:", np.array(train_data[0]['pose']).shape)
+print("Sample target text:", train_data[0]['text'])
+
+class PoseBartEncoder(BartEncoder):
+    def __init__(self, config):
+        super().__init__(config)
+        self.pose_embedding = nn.Linear(150, config.d_model, bias=False)
+
+    def forward(self, input_tensors=None, **kwargs):
+        assert input_tensors is not None, "input_tensors not found in kwargs"
+
+        inputs_embeds = self.pose_embedding(input_tensors.to(self.pose_embedding.weight.device))
         
-        # Thay thế embedding gốc (50265, 768) bằng nn.Linear(151, 768)
-        self.custom_embedding = nn.Linear(151, 768)
+        kwargs.pop("inputs_embeds", None)
+        
+        return super().forward(inputs_embeds=inputs_embeds, **kwargs)
 
-    def forward(self, pose_inputs, labels):
-        """
-        pose_inputs: Tensor có shape (batch_size, T, 151)
-        labels: input_ids của văn bản (batch_size, seq_length)
-        """
-        embedded_inputs = self.custom_embedding(pose_inputs)  # (batch_size, T, 768)
+class PoseBartModel(BartModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.encoder = PoseBartEncoder(config)
 
-        outputs = self.bart(
-            inputs_embeds=embedded_inputs, 
-            labels=labels
-        )
-        return outputs
+# Define PoseBART model
+class PoseBART(BartForConditionalGeneration):
+    def __init__(self, config: BartConfig):
+        super().__init__(config)
+        self.model = PoseBartModel(config)
 
-# Khởi tạo model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = CustomBART().to(device)
+        # Lớp embedding riêng cho pose keypoints (150 -> d_model)
+        self.pose_embedding = nn.Linear(150, config.d_model, bias=False)
 
-# ============================
-# 3. Tiền xử lý dữ liệu
-# ============================
-from transformers import BartTokenizer
-tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+        self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
+        self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
-def preprocess_function(examples):
-    MAX_LENGTH_INPUT = 200  # Giới hạn số frame (T)
-    MAX_LENGTH_OUTPUT = 128
+        # Initialize weights and apply final processing
+        self.post_init()
 
-    # Lấy dữ liệu pose
-    pose_matrices = [torch.tensor(pose[:MAX_LENGTH_INPUT], dtype=torch.float32) for pose in examples["pose"]]
+    def forward(self, input_tensors=None, labels=None, attention_mask=None, **kwargs):
+        kwargs.pop("num_items_in_batch", None)
+        assert input_tensors is not None, "Please pass pose matrix to `input_tensors`."
+        result = super().forward(input_tensors=input_tensors, labels=labels, attention_mask=attention_mask, **kwargs)
+        return result
 
-    # Pad/crop pose matrices để đảm bảo đúng kích thước (MAX_LENGTH_INPUT, 151)
-    pose_tensors = torch.zeros(len(pose_matrices), MAX_LENGTH_INPUT, 151)
-    for i, pose in enumerate(pose_matrices):
-        pose_tensors[i, :pose.shape[0], :] = pose
-
-    # Tokenize văn bản đầu ra
-    targets = tokenizer(examples["text"], max_length=MAX_LENGTH_OUTPUT, truncation=True, padding="max_length")
-    print(targets["input_ids"])
-    return {"pose": pose_tensors, "labels": targets["input_ids"]}
-
-# tokenized_train = split_dataset["train"].map(preprocess_function, batched=True, remove_columns=["pose", "text"])
-# tokenized_test = split_dataset["test"].map(preprocess_function, batched=True, remove_columns=["pose", "text"])
-tokenized_train = split_dataset["train"].map(preprocess_function, batched=True)
-tokenized_test = split_dataset["test"].map(preprocess_function, batched=True)
-
-"""
-print(tokenized_train[0].keys())  # Kiểm tra dữ liệu đã được xử lý
-pose_tensor = torch.tensor(tokenized_train[0]["pose"])  # Chuyển đổi pose thành tensor
-print(pose_tensor.shape)  # Kiểm tra kích thước pose tensor
-print(f"Pose Tensor: {pose_tensor}")  # In ra tensor
-print(tokenized_train[0]["labels"])  # Kiểm tra labels
-
-import sys
-sys.exit(0)  # Dừng chương trình sau khi kiểm tra dữ liệu
-"""
-
-# ============================
-# 4. Cấu hình Trainer
-# ============================
-def collate_fn(batch):
-    for idx, item in enumerate(batch):
-        print(f"Item {idx} keys: {item.keys()}")
-    poses = torch.stack([item["pose"] for item in batch]).to(device)
-    labels = torch.tensor([item["labels"] for item in batch]).to(device)
-    return {"pose_inputs": poses, "labels": labels}
-
-training_args = TrainingArguments(
-    output_dir="./bart_pose2text",
-    eval_strategy="epoch",
-    learning_rate=5e-5,
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=4,
-    num_train_epochs=3,
-    weight_decay=0.01,
-    save_total_limit=2,
-    logging_steps=10,
-    logging_dir="./logs",
+# BART Configuration
+config = BartConfig(
+    encoder_layers=6,
+    encoder_ffn_dim=4096,
+    encoder_attention_heads=16,
+    decoder_layers=6,
+    decoder_ffn_dim=4096,
+    decoder_attention_heads=16,
+    d_model=1024
 )
 
-# Custom Trainer để phù hợp với input mới
-class CustomTrainer(Trainer):
-    def __init__(self, model, args, train_dataset, eval_dataset, data_collator=None):
-        # Chuyển tiếp các tham số cho lớp cha (Trainer)
-        super().__init__(
-            model=model,
-            args=args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            data_collator=data_collator,  # Đảm bảo tham số data_collator được truyền vào
-        )
-    """"
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Tính loss giống như trong phần trước
-        outputs = model(inputs["pose_inputs"], inputs["labels"])
-        loss = outputs.loss
-        return (loss, outputs) if return_outputs else loss"
-    """
+tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
 
-trainer = CustomTrainer(
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PoseBART(config).to(device)
+
+# Preprocessing function
+def preprocess_function(examples):
+    MAX_LENGTH_INPUT = 256
+    MAX_LENGTH_OUTPUT = 32
+
+    batch_size = len(examples["pose"])
+    pose_tensors = torch.zeros(batch_size, MAX_LENGTH_INPUT, 150, dtype=torch.float32)
+    attention_mask = torch.zeros(batch_size, MAX_LENGTH_INPUT, dtype=torch.long)
+    
+    for i, pose in enumerate(examples["pose"]):
+        curr_len = min(len(pose), MAX_LENGTH_INPUT)
+        pose_tensors[i, -curr_len:, :] = torch.tensor(pose[-curr_len:])
+        attention_mask[i, -curr_len:] = 1  # Mark real frames
+        
+    targets = tokenizer(
+        examples["text"],
+        max_length=MAX_LENGTH_OUTPUT,
+        truncation=True,
+        padding='max_length',
+        padding_side='right'
+    )
+
+    return {"input_tensors": pose_tensors, "attention_mask": attention_mask, "labels": targets["input_ids"]}
+
+print("\n--- Preprocessing Data ---")
+tokenized_train = train_data.map(preprocess_function, batched=True, remove_columns=["pose", "text"])
+tokenized_test  = test_data.map(preprocess_function, batched=True, remove_columns=["pose", "text"])
+
+training_args = TrainingArguments(
+    output_dir="PoseBART_v1",
+    evaluation_strategy="epoch",
+    learning_rate=1e-4,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=2,
+    num_train_epochs=5, ##################################
+    # weight_decay=0.01, # Usually used when data is small
+    save_total_limit=2,
+    logging_steps=1,
+    logging_dir="logs",
+    report_to='none'
+)
+
+def custom_collate_fn(batch):
+    input_tensors = torch.stack([torch.tensor(item["input_tensors"], dtype=torch.float32) for item in batch])
+    attention_masks = torch.stack([torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch])
+    labels = torch.stack([torch.tensor(item["labels"], dtype=torch.long) for item in batch])
+    return {"input_tensors": input_tensors, "attention_mask": attention_masks, "labels": labels}
+
+# Train model
+model.train()
+trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_train,
     eval_dataset=tokenized_test,
-    data_collator=collate_fn,
+    data_collator=custom_collate_fn,
 )
 
-# ============================
-# 5. Huấn luyện mô hình
-# ============================
-print("Starting training...")
+    
+print("\n--- Training ---")
 trainer.train()
-print("Training completed.")
-print("=============================")
 
-# ============================
-# 6. Suy luận
-# ============================
-def predict_pose_to_text(pose_array):
-    pose_array = pose_array.reshape(-1, 151)  # Đảm bảo đúng shape (T, 151)
-    input_tensor = torch.tensor(pose_array, dtype=torch.float32).unsqueeze(0).to(device)  # Thêm batch dimension
-    
-    # Chạy forward
-    outputs = model(pose_inputs=input_tensor, labels=None)
-    
-    # Lấy ID từ đầu ra
-    output_ids = outputs.logits.argmax(dim=-1)
 
-    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+# Inference
+model.eval()
+generation_config = GenerationConfig(
+	max_new_tokens = 128,
+	stop_strings = ["</s>", "<pad>"],
+)
+def predict_pose_to_text(pose_array, attention_mask):
+        pose_tensor = torch.tensor(pose_array, dtype=torch.float32).unsqueeze(0).to(device)
+        #print("Pose tensor shape:", pose_tensor.shape)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long).unsqueeze(0).to(device)
 
-# Test với một mẫu
-print("Testing prediction...")
-test_pose = np.array(json.loads(split_dataset["test"][1]["pose"]))
-generated_text = predict_pose_to_text(test_pose)
-example_text = split_dataset["test"][1]["text"]
-print("Original Text:", example_text)
-print("Generated Text:", generated_text)
+        with torch.no_grad():
+                generated_ids = model.generate(
+                        input_tensors=pose_tensor,
+                        attention_mask=attention_mask,
+                        tokenizer=tokenizer,
+                        generation_config=generation_config
+                )
+
+        #print("Generated token IDs:", generated_ids)
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        return generated_text if generated_text.strip() else "[EMPTY OUTPUT]"
+
+# Test inference on a few examples
+print("\n--- Testing Inference ---")
+TEST_CASE_NUM = 10
+for i in range(TEST_CASE_NUM):
+        output_text = predict_pose_to_text(tokenized_train[i]["input_tensors"], tokenized_train[i]["attention_mask"])
+        print(f"[Test case {i+1}]")
+        print("Generated text:", output_text)
+        print("Groundtruth:", train_data[i*7]["text"])
+        print("\n")
